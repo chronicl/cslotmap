@@ -1,4 +1,4 @@
-use deferred_slotmap::{ConcurrentSlotMap, Handle, new::DeferredSlotMap};
+use cslotmap::{ConcurrentSlotMap, SlotHandle};
 use divan::{Bencher, black_box};
 use rand::seq::SliceRandom;
 
@@ -18,26 +18,48 @@ trait Map<T>: Send + Sync {
     fn get(&self, handle: Self::Handle) -> Option<T>
     where
         T: Copy;
-    fn remove(&mut self, handle: Self::Handle) -> bool;
+    fn remove(&mut self, handle: Self::Handle) -> Option<T>;
 }
 
 impl<T: Send + Sync + Copy> Map<T> for ConcurrentSlotMap<T> {
-    type Handle = Handle<T>;
+    type Handle = SlotHandle;
 
     fn new() -> Self {
         ConcurrentSlotMap::new(0, 0)
     }
 
     fn insert(&mut self, value: T) -> Self::Handle {
-        self.insert_mut(value)
+        self.insert(value)
     }
 
     fn get(&self, handle: Self::Handle) -> Option<T> {
         self.get(handle).copied()
     }
 
-    fn remove(&mut self, handle: Self::Handle) -> bool {
-        self.free_mut(handle)
+    fn remove(&mut self, handle: Self::Handle) -> Option<T> {
+        self.remove(handle)
+    }
+}
+
+struct ConcurrentSlotMapWithConcurrentOperations<T>(ConcurrentSlotMap<T>);
+impl<T: Send + Sync + Copy> Map<T> for ConcurrentSlotMapWithConcurrentOperations<T> {
+    type Handle = SlotHandle;
+
+    fn new() -> Self {
+        ConcurrentSlotMapWithConcurrentOperations(ConcurrentSlotMap::new(20_000, 20_000))
+    }
+
+    fn insert(&mut self, value: T) -> Self::Handle {
+        self.0.concurrent_insert(value).unwrap()
+    }
+
+    fn get(&self, handle: Self::Handle) -> Option<T> {
+        self.0.get(handle).copied()
+    }
+
+    fn remove(&mut self, handle: Self::Handle) -> Option<T> {
+        self.0.deferred_remove(handle).unwrap();
+        None
     }
 }
 
@@ -56,12 +78,12 @@ impl<T: Send + Sync + Copy> Map<T> for slotmap::SlotMap<slotmap::DefaultKey, T> 
         self.get(handle).copied()
     }
 
-    fn remove(&mut self, handle: Self::Handle) -> bool {
-        self.remove(handle).is_some()
+    fn remove(&mut self, handle: Self::Handle) -> Option<T> {
+        self.remove(handle)
     }
 }
 
-#[divan::bench(types = [slotmap::SlotMap<slotmap::DefaultKey, u32>, ConcurrentSlotMap<u32>], threads = [1, 4, 16], args = LENS)]
+#[divan::bench(types = [slotmap::SlotMap<slotmap::DefaultKey, u32>, ConcurrentSlotMap<u32>, ConcurrentSlotMapWithConcurrentOperations<u32>], threads = [1, 4, 16], args = LENS)]
 fn get_sequential<M: Map<u32>>(bencher: Bencher, len: usize) {
     let mut map = M::new();
     let handles: Vec<_> = (0..len).map(|i| map.insert(i as u32)).collect();
@@ -73,7 +95,7 @@ fn get_sequential<M: Map<u32>>(bencher: Bencher, len: usize) {
     })
 }
 
-#[divan::bench(types = [slotmap::SlotMap<slotmap::DefaultKey, u32>, ConcurrentSlotMap<u32>], threads = [1, 4, 16], args = LENS)]
+#[divan::bench(types = [slotmap::SlotMap<slotmap::DefaultKey, u32>, ConcurrentSlotMap<u32>, ConcurrentSlotMapWithConcurrentOperations<u32>], threads = [1, 4, 16], args = LENS)]
 fn get_random<M: Map<u32>>(bencher: Bencher, len: usize) {
     let mut map = M::new();
     let mut handles: Vec<_> = (0..len).map(|i| map.insert(i as u32)).collect();
@@ -86,7 +108,7 @@ fn get_random<M: Map<u32>>(bencher: Bencher, len: usize) {
     })
 }
 
-#[divan::bench(types = [slotmap::SlotMap<slotmap::DefaultKey, u32>, ConcurrentSlotMap<u32>], args = LENS)]
+#[divan::bench(types = [slotmap::SlotMap<slotmap::DefaultKey, u32>, ConcurrentSlotMap<u32>, ConcurrentSlotMapWithConcurrentOperations<u32>], args = LENS)]
 fn insert<M: Map<u32>>(bencher: Bencher, len: usize) {
     bencher.with_inputs(|| M::new()).bench_values(|mut map| {
         for i in 0..len {
@@ -95,7 +117,7 @@ fn insert<M: Map<u32>>(bencher: Bencher, len: usize) {
     })
 }
 
-#[divan::bench(types = [slotmap::SlotMap<slotmap::DefaultKey, u32>, ConcurrentSlotMap<u32>], args = LENS)]
+#[divan::bench(types = [slotmap::SlotMap<slotmap::DefaultKey, u32>, ConcurrentSlotMap<u32>, ConcurrentSlotMapWithConcurrentOperations<u32>], args = LENS)]
 fn remove<M: Map<u32>>(bencher: Bencher, len: usize) {
     bencher
         .with_inputs(|| {

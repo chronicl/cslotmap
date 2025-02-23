@@ -1,6 +1,4 @@
-use deferred_slotmap::{
-    ConcurrentSlotMap, Handle, new::DeferredSlotMap, new::Handle as DeferredHandle,
-};
+use cslotmap::{ConcurrentSlotMap, SlotHandle};
 use divan::{Bencher, black_box};
 use rand::prelude::*;
 use std::sync::{Arc, RwLock};
@@ -26,11 +24,26 @@ fn map<M: Map<u32>>(len: usize) -> M {
     M::new(size, size)
 }
 
+#[divan::bench(types = [LocklessSlotMap<u32>, EpochSlotMap<u32>, ConcurrentSlotMap<u32>, LockedSlotMap<u32>], args = LENS, threads = [1, 4, 16])]
+fn get<M: Map<u32>>(bencher: Bencher, len: usize) {
+    let mut map: M = map(len);
+    let pin = map.pin();
+    let handles: Vec<_> = (0..len).map(|i| map.insert(i as u32, &pin)).collect();
+    map.flush_deferred();
+
+    bencher.bench(|| {
+        let pin = map.pin();
+        for handle in &handles {
+            black_box(map.get(black_box(*handle), &pin));
+        }
+    });
+}
+
 // Using our own threading instead of using divans built in threading,
 // because divan only offers bencher.with_inputs which gives each thread it's own map
 // instead of all threads sharing one map. And creating **one** map for all samples
 // of a benchmark is also not the right solution for benches for `insert` for example.
-#[divan::bench(types = [LocklessSlotMap<u32>, EpochSlotMap<u32>, DeferredSlotMap<u32>, ConcurrentSlotMap<u32>, LockedSlotMap<u32>], args = LENS)]
+#[divan::bench(types = [LocklessSlotMap<u32>, EpochSlotMap<u32>, ConcurrentSlotMap<u32>, LockedSlotMap<u32>], args = LENS)]
 fn get_sequential<M: Map<u32>>(bencher: Bencher, len: usize) {
     bencher
         .with_inputs(|| {
@@ -54,7 +67,7 @@ fn get_sequential<M: Map<u32>>(bencher: Bencher, len: usize) {
         });
 }
 
-#[divan::bench(types = [LocklessSlotMap<u32>, EpochSlotMap<u32>, DeferredSlotMap<u32>, ConcurrentSlotMap<u32>, LockedSlotMap<u32>], args = LENS)]
+#[divan::bench(types = [LocklessSlotMap<u32>, EpochSlotMap<u32>, ConcurrentSlotMap<u32>, LockedSlotMap<u32>], args = LENS)]
 fn get_random<M: Map<u32>>(bencher: Bencher, len: usize) {
     bencher
         .with_inputs(|| {
@@ -79,7 +92,7 @@ fn get_random<M: Map<u32>>(bencher: Bencher, len: usize) {
         });
 }
 
-#[divan::bench(types = [LocklessSlotMap<u32>, EpochSlotMap<u32>, DeferredSlotMap<u32>, ConcurrentSlotMap<u32>, LockedSlotMap<u32>], args = LENS)]
+#[divan::bench(types = [LocklessSlotMap<u32>, EpochSlotMap<u32>, ConcurrentSlotMap<u32>, LockedSlotMap<u32>], args = LENS)]
 fn insert<M: Map<u32>>(bencher: Bencher, len: usize) {
     bencher.with_inputs(|| map(len)).bench_values(|mut map: M| {
         std::thread::scope(|s| {
@@ -96,7 +109,7 @@ fn insert<M: Map<u32>>(bencher: Bencher, len: usize) {
     });
 }
 
-#[divan::bench(types = [LocklessSlotMap<u32>, EpochSlotMap<u32>, DeferredSlotMap<u32>, ConcurrentSlotMap<u32>, LockedSlotMap<u32>], args = LENS)]
+#[divan::bench(types = [LocklessSlotMap<u32>, EpochSlotMap<u32>, ConcurrentSlotMap<u32>, LockedSlotMap<u32>], args = LENS)]
 fn remove<M: Map<u32>>(bencher: Bencher, len: usize) {
     bencher
         .with_inputs(|| {
@@ -120,7 +133,7 @@ fn remove<M: Map<u32>>(bencher: Bencher, len: usize) {
         });
 }
 
-#[divan::bench(types = [LocklessSlotMap<u32>, EpochSlotMap<u32>, DeferredSlotMap<u32>, ConcurrentSlotMap<u32>, LockedSlotMap<u32>], args = LENS)]
+#[divan::bench(types = [LocklessSlotMap<u32>, EpochSlotMap<u32>, ConcurrentSlotMap<u32>, LockedSlotMap<u32>], args = LENS)]
 fn mixed_operations<M: Map<u32>>(bencher: Bencher, len: usize) {
     #[derive(Clone, Copy)]
     enum Operation<H> {
@@ -212,7 +225,7 @@ trait Map<T>: Send + Sync {
 }
 
 impl<T: Send + Sync> Map<T> for ConcurrentSlotMap<T> {
-    type Handle = Handle<T>;
+    type Handle = SlotHandle;
     type Pin = ();
 
     fn new(len: usize, frees: usize) -> Self {
@@ -220,7 +233,7 @@ impl<T: Send + Sync> Map<T> for ConcurrentSlotMap<T> {
     }
 
     fn insert(&self, value: T, _: &Self::Pin) -> Self::Handle {
-        self.insert(value).unwrap()
+        self.concurrent_insert(value).unwrap()
     }
 
     fn get(&self, handle: Self::Handle, _: &Self::Pin) -> Option<T>
@@ -233,37 +246,7 @@ impl<T: Send + Sync> Map<T> for ConcurrentSlotMap<T> {
     fn pin(&self) -> Self::Pin {}
 
     fn remove(&self, handle: Self::Handle, _: &Self::Pin) -> bool {
-        self.free(handle).is_ok()
-    }
-
-    fn flush_deferred(&mut self) {
-        self.flush();
-    }
-}
-
-impl<T: Send + Sync> Map<T> for DeferredSlotMap<T> {
-    type Handle = DeferredHandle<T>;
-    type Pin = ();
-
-    fn new(len: usize, frees: usize) -> Self {
-        DeferredSlotMap::new(len, frees)
-    }
-
-    fn insert(&self, value: T, _: &Self::Pin) -> Self::Handle {
-        self.insert(value).unwrap()
-    }
-
-    fn get(&self, handle: Self::Handle, _: &Self::Pin) -> Option<T>
-    where
-        T: Copy,
-    {
-        self.get(handle).copied()
-    }
-
-    fn pin(&self) -> Self::Pin {}
-
-    fn remove(&self, handle: Self::Handle, _: &Self::Pin) -> bool {
-        self.free(handle).is_ok()
+        self.deferred_remove(handle).is_ok()
     }
 
     fn flush_deferred(&mut self) {

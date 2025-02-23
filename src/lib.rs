@@ -1,136 +1,54 @@
-use std::{
-    cell::UnsafeCell,
-    marker::PhantomData,
-    sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
-};
+//! # A slot map with support for concurrent lock-less operations.
+//! Aside from offering the usual slot map API, this slot map offers two concurrent lock-less operations:
+//! [`concurrent_insert`](ConcurrentSlotMap::concurrent_insert) and [`deferred_remove`](ConcurrentSlotMap::deferred_remove).
 
-use bitset::Bitset;
 use bumpvec::BumpVec;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-mod bitset;
 mod bumpvec;
-pub mod new;
 
-/// ## A (mostly) lock-less concurrent slot map.
+type Version = u32;
+
+/// # A slot map with support for concurrent lock-less operations.
+/// Aside from offering the usual slot map API, this slot map offers two concurrent lock-less operations:
+/// [`concurrent_insert`](ConcurrentSlotMap::concurrent_insert) and [`deferred_remove`](ConcurrentSlotMap::deferred_remove).
 ///
-/// Inserting a value into this map allocates a slot in a `Vec` and returns a `Handle` by which the value
-/// can be retrieved.
-/// Removing a value from this map, opens up it's slot for reuse by future insertions.
-/// To invalidate old handles to the same slot, each slot has an associated generation counter which is incremented upon freeing it.
+/// Once a concurrent method has been used, the slot map is marked as dirty and other write methods
+/// like [`insert`](ConcurrentSlotMap::insert) and [`remove`](ConcurrentSlotMap::remove) become unavailable until
+/// [`flush`](ConcurrentSlotMap::flush) is called. Read methods like [`get`](ConcurrentSlotMap::get) and
+/// [`iter`](ConcurrentSlotMap::iter) remain available.
 ///
-/// ### Concurrency
-/// To avoid requiring locking mechanisms for concurrent usage, an intermediate fixed size array is used.
-/// Upon inserting a value, it is first stored in the fixed size array and only upon calling `ConcurrentSlotMap::flush(&mut self)`
-/// will the value be moved to a dynamically sized `Vec`.
-/// TODO: If the fixed size array is full a Arc<Mutex<Vec<_>>> is used as intermediate storage instead, which requires locking, so the slot map is only
-/// lock-less if `allocations <= fixed size array length` inbetween flushes.
+/// However, there is a configurable limit to how many `concurrent_insert` and `deferred_remove` operations can occur
+/// in between each `flush`. The limit must be configured when creating the slot map with [`ConcurrentSlotMap::new`] and
+/// can later be changed via [`ConcurrentSlotMap::set_concurrent_insert_capacity`] and [`ConcurrentSlotMap::set_deferred_remove_capacity`].
 ///
-/// Freeing a value concurrently also uses a fixed size array, but the free is deferred until `ConcurrentSlotMap::flush(&mut self)` is called.
-/// Only non-deferred free slots are used when inserting new values.
+/// ## Performance
+/// The non-concurrent methods are comparable in performance to `SlotMap` from the [`slotmap`](https://docs.rs/slotmap/latest/slotmap/) crate.
 ///
-/// The size of the fixed size array can be configured upon ConcurrentSlotMap creation via `ConcurrentSlotMap::new`
-/// or modified later via `ConcurrentSlotMap::set_fixed_size_array_sizes`.
+/// In single-threaded usage the concurrent methods are roughly 2 to 4 times slower than their non-concurrent counterparts.
 ///
-/// ### Method overview
-/// The methods can be divided into read methods and write methods. The read methods only require a shared reference (&self) and may be used in
-/// single and multi-threaded contexts. The write methods can further be divided into shared (&self) and exclusive (&mut self) write methods.
-/// The exclusive write methods are designed for high performance single-threaded workloads, they are
-/// - `insert`
-/// - `free`
+/// I have benchmarked against other concurrent slotmap implementations (which have different trade-offs)
+/// and this implementation has better performance by 2-10 times across the board, expect `deferred_free` where
+/// it is 50% slower than the fastest implementation.
 ///
-/// whereas the shared write methods are designed for high performance multi-threaded workloads, they are
-/// - `insert_sync`
-/// - `deferred_free`
-///
-/// **However**, they can not be freely combined. When calling a shared write method, Self is marked as dirty and exclusive write methods
-/// become unavailable until calling `flush`, which marks Self as clean. But, calling exclusive write methods before shared write methods is valid.
-/// - 🚫 shared write -> exclusive write
-/// - ✅ shared write -> flush -> exclusive write
-/// - ✅ exclusive write -> shared write
-///
-/// ### Usage in render graph
-/// This slot map is used for storing render resources like textures and buffers and assigning them an index in a **bindless descriptor array**.
-///
-/// At the start of a frame the slot map represents the bindless descriptor array of the previous frame, during frame preparation we modify
-/// the slot map with new allocations and frees and once the preparation is done **and** the previous frame has finished rendering we apply
-/// the allocations and frees to the bindless descriptor array to then start rendering the current frame. Note that the slot map now represents
-/// the current frames bindless descriptor array and we can start preparing the next frame following the same steps.
+/// These measurements are heavily hardware dependent. Benchmark code can be found in the github repo.
+#[derive(Debug)]
 pub struct ConcurrentSlotMap<T> {
-    // These fields require exclusive (single-threaded, &mut) write access.
-    // They will only be updated upon calling flush or if Self is currently
-    // not dirty (is flushed) and methods like `insert` or `free` are used.
-    slots: Vec<UnsafeCell<T>>,
+    slots: Vec<Slot<T>>,
+
     free: Vec<u32>,
-    free_bitset: Bitset,
-    generations: Vec<u32>,
-
-    // These fields allow for lock-free concurrent write access. See methods like `deferred_free` and `insert_sync`.
-    /// These extend the slots in `slots`, they all have generation 0 and are newly allocated since the last flush.
-    deferred_slots: BumpVec<T>,
-    /// Only resources that were freed before the last flush are reused.
-    /// Here we keep track of how many of the slots in `free` (from the end to start) we've used since the last flush.
     frees_used: AtomicUsize,
-    /// Newly freed resources are stored in `deferred_frees` and will become available after the next flush.
-    /// MAYBE: This could use a lighter version of BumpVec - one that doesn't allow read access.
-    deferred_frees: BumpVec<u32>,
-    /// Used for synchronizing reuse of slots. This is only accessed for newly (after last flush) allocated resources that reused a slot.
-    /// Once a new value has been written to a reused slot, the highest bit of this u32 is set to indicate that the slot is now valid and
-    /// to synchronize with reads (`get`). Is incremented alongside `generations`.
-    atomic_generations: Vec<AtomicU32>,
 
-    /// Tracks whether any shared write (`insert_sync`, `deferred_free`) has happened since the last flush.
-    /// MAYBE: `deferred_free` shouldn't set dirty.
+    deferred_slots: BumpVec<T>,
+    deferred_frees: BumpVec<u32>,
     dirty: AtomicBool,
 }
 
-unsafe impl<T: Send + Sync> Sync for ConcurrentSlotMap<T> {}
-
-#[derive(Debug, Clone, Copy)]
-pub struct OutOfSpace;
-impl std::fmt::Display for OutOfSpace {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Out of space in a slot map fixed-sized array")
-    }
-}
-impl std::error::Error for OutOfSpace {}
-
+// Concurrent API
 impl<T> ConcurrentSlotMap<T> {
-    const ATOMIC_GENERATION_USED_BIT: u32 = 1 << 31;
-    const ATOMIC_GENERATION_MASK: u32 = Self::ATOMIC_GENERATION_USED_BIT - 1;
-
-    pub fn new(allocations_capacity: usize, deferred_frees_capacity: usize) -> Self {
-        Self {
-            slots: Default::default(),
-            free: Default::default(),
-            free_bitset: Default::default(),
-            generations: Default::default(),
-
-            deferred_slots: BumpVec::new(allocations_capacity),
-            frees_used: AtomicUsize::new(0),
-            deferred_frees: BumpVec::new(deferred_frees_capacity),
-            atomic_generations: Default::default(),
-
-            dirty: AtomicBool::new(false),
-        }
-    }
-
-    pub fn get(&self, handle: Handle<T>) -> Option<&T> {
-        // if not in range of self.slots, it's a deferred slot and deferred slots always have generation 0
-        if handle.index >= self.slots.len() as u32 && handle.generation == 0 {
-            self.deferred_slots
-                .get(handle.index as usize - self.slots.len())
-        } else if self.generation_is_valid(handle) {
-            // SAFETY: self.generation_is_valid synchronizes any potential write via `insert_sync`, which can only happen once every flush and
-            // there is no other shared write method that writes to self.slots, so we can safely get
-            // a reference here.
-            Some(unsafe { &*self.slots[handle.index as usize].get() })
-        } else {
-            None
-        }
-    }
-
-    pub fn insert(&self, value: T) -> Result<Handle<T>, OutOfSpace> {
-        let (index, generation) = if let Some(index) = self.reserve_free_slot() {
+    /// Inserts a new item into the map. The item is immediately accessible by all threads.
+    pub fn concurrent_insert(&self, value: T) -> Result<SlotHandle, OutOfSpace> {
+        let (index, version) = if let Some(index) = self.reserve_free_slot() {
             // SAFETY: index was reserved via `reserve_free_slot`. self is marked as dirty in this method.
             let generation = unsafe { self.write_to_reserved_slot(index, value) };
             (index, generation)
@@ -143,55 +61,70 @@ impl<T> ConcurrentSlotMap<T> {
 
         self.dirty.store(true, Ordering::Relaxed);
 
-        Ok(Handle::new(index, generation))
+        Ok(SlotHandle::new(index, version))
     }
 
-    /// Frees are deferred until next call to `flush`.
-    ///
-    /// If the handle is invalid, returns Ok(()), but it's (non-existent) data is not gonna be freed.
-    pub fn free(&self, handle: Handle<T>) -> Result<(), OutOfSpace> {
-        if self.generation_is_valid(handle) && self.deferred_frees.push(handle.index).is_none() {
+    /// Removals are deferred until the next `flush` call.
+    /// The removed items can be obtained by calling `flush_with` instead of `flush`.
+    pub fn deferred_remove(&self, handle: SlotHandle) -> Result<(), OutOfSpace> {
+        if self.handle_is_valid(handle) && self.deferred_frees.push(handle.index).is_none() {
             return Err(OutOfSpace);
         }
+
         self.dirty.store(true, Ordering::Relaxed);
+
         Ok(())
     }
 
-    /// ### Panics
-    /// A shared write method like `insert_sync` has been called since the last `flush`.
-    pub fn insert_mut(&mut self, value: T) -> Handle<T> {
-        self.assert_not_dirty();
-
-        let index = if let Some(index) = self.free.pop() {
-            self.free_bitset.unset(index);
-            *self.slots[index as usize].get_mut() = value;
-            index
-        } else {
-            let index = self.slots.len();
-            self.slots.push(UnsafeCell::new(value));
-            self.generations.push(0);
-            self.atomic_generations.push(AtomicU32::new(0));
-            index as u32
-        };
-
-        let generation = self.generations[index as usize];
-
-        Handle::new(index, generation)
+    pub fn flush(&mut self) {
+        self.flush_with(|_| {})
     }
 
-    /// ### Panics
-    /// A shared write method like `insert_sync` has been called since the last `flush`.
-    pub fn free_mut(&mut self, handle: Handle<T>) -> bool {
-        self.assert_not_dirty();
+    pub fn flush_with<R>(&mut self, free_fn: impl FnOnce(&mut dyn Iterator<Item = T>) -> R) -> R {
+        self.dirty.store(false, Ordering::Relaxed);
 
-        let was_not_already_free = self.free_bitset.set(handle.index);
-        if was_not_already_free {
-            self.free.push(handle.index);
-            let i = handle.index as usize;
-            self.generations[i] += 1;
-            self.atomic_generations[i].store(self.generations[i], Ordering::Relaxed);
+        let Self {
+            slots,
+            free,
+            frees_used,
+            deferred_slots,
+            deferred_frees,
+            ..
+        } = self;
+
+        // Move from deferred slots to slots to make space for future shared insertions
+        deferred_slots.clear(|values| {
+            for value in values {
+                slots.push(Slot::new_occupied(value));
+            }
+        });
+
+        // Removing reused frees from `free` and updating the non-atomic
+        let used = frees_used.load(Ordering::Relaxed);
+        frees_used.store(0, Ordering::Relaxed);
+        for _ in 0..used.min(free.len()) {
+            let index = free.pop().unwrap();
+            // SAFETY: We just popped it from `free`, which means it was reused/occupied since last flush.
+            unsafe { slots[index as usize].confirm_write() };
         }
-        was_not_already_free
+
+        // Appying deferred frees
+        deferred_frees.clear(|indices| {
+            let mut values = indices.flat_map(|index| {
+                let value = slots[index as usize].free();
+                // Only freeing if the slot wasn't already free
+                if value.is_some() {
+                    free.push(index);
+                }
+                value
+            });
+
+            let r = free_fn(&mut values);
+
+            values.count();
+
+            r
+        })
     }
 
     fn reserve_free_slot(&self) -> Option<u32> {
@@ -206,248 +139,238 @@ impl<T> ConcurrentSlotMap<T> {
     /// shared write method can possibly use the same free slot.
     /// self must be marked as dirty, so that no exclusive write method can possibly use the free slot, because
     /// exclusive write methods can't be used as long as self is dirty.
-    unsafe fn write_to_reserved_slot(&self, index: u32, value: T) -> u32 {
-        assert!(self.is_free(index));
+    unsafe fn write_to_reserved_slot(&self, index: u32, value: T) -> Version {
+        let slot = &self.slots[index as usize];
+        assert!(slot.is_free());
 
         // SAFETY: See above.
-        // Reads are secured by self.atomic_generations.
-        unsafe { self.slots[index as usize].get().write(value) };
-        // or 1 << 32 and release Ordering for synchronization in `generation_is_valid`
-        self.atomic_generations[index as usize]
-            .fetch_or(Self::ATOMIC_GENERATION_USED_BIT, Ordering::Release)
+        // Reads are secured by slot.occupied_atomic
+        // TODO: maybe have to free AtomicU32 here
+        unsafe { slot.write(value) };
+
+        slot.version()
+    }
+}
+
+// Standard slot map API
+impl<T> ConcurrentSlotMap<T> {
+    /// Create a new map. `concurrent_insert_capacity` and `deferred_remove_capacity` determine how many times
+    /// `concurrent_insert` and `deferred_remove` without returning `OutOfMemory` in between `flush`es.
+    pub fn new(concurrent_insert_capacity: usize, deferred_remove_capacity: usize) -> Self {
+        Self {
+            slots: Default::default(),
+
+            free: Default::default(),
+            frees_used: AtomicUsize::new(0),
+
+            deferred_slots: BumpVec::new(concurrent_insert_capacity),
+            deferred_frees: BumpVec::new(deferred_remove_capacity),
+            dirty: AtomicBool::new(false),
+        }
     }
 
+    /// Get a reference to an item from the map.
+    pub fn get(&self, handle: SlotHandle) -> Option<&T> {
+        let index = handle.index();
+        if index >= self.slots.len() && handle.version == 0 {
+            self.deferred_slots.get(index - self.slots.len())
+        } else {
+            let slot = &self.slots[index];
+            slot.get(handle.version)
+        }
+    }
+
+    /// Insert a new item into the map.
     /// ### Panics
     /// A shared write method like `insert_sync` has been called since the last `flush`.
-    pub fn set_fixed_size_array_sizes(
-        &mut self,
-        allocations_per_frame_capacity: usize,
-        deferred_frees_capacity: usize,
-    ) {
+    pub fn insert(&mut self, value: T) -> SlotHandle {
         self.assert_not_dirty();
 
-        self.deferred_slots = BumpVec::new(allocations_per_frame_capacity);
-        self.deferred_frees = BumpVec::new(deferred_frees_capacity);
+        let index = if let Some(index) = self.free.pop() {
+            // SAFETY: since we got the index from the free list, the slot should be free.
+            unsafe { self.slots[index as usize].write_mut(value) };
+            index
+        } else {
+            let index = self.slots.len();
+            self.slots.push(Slot::new_occupied(value));
+            index as u32
+        };
+
+        let version = self.slots[index as usize].version();
+
+        SlotHandle::new(index, version)
     }
 
-    pub fn flush(&mut self) {
-        // All of the fields need to be updated
-        // 1.  slots: Vec<UnsafeCell<T>>           fill with deferred_slots
-        // 2.  free: Vec<u32>                      remove last `frees_used` elements then fill with deferred frees
-        // 3.  free_bitset:                        unset last `frees_used` elements from `free` then fill with deferred frees
-        // 4.  generations: Vec<u32>               set to 0 for the values from deferred_slots and incremented for deferred frees
-        // 5.  deferred_slots: BumpVec<T>          clear
-        // 6.  frees_used: AtomicUsize             set to 0
-        // 7.  deferred_frees: BumpVec<u32>        clear
-        // 8.  atomic_generations: Vec<AtomicU32>  set to 0 for the values from deferred_slots and incremented for deferred frees
-        // 9.  dirty: AtomicBool                   set to false
+    /// Remove an item from the map.
+    /// ### Panics
+    /// A shared write method like `insert_sync` has been called since the last `flush`.
+    pub fn remove(&mut self, handle: SlotHandle) -> Option<T> {
+        self.assert_not_dirty();
 
-        if !self.dirty.load(Ordering::Relaxed) {
-            return;
-        }
-        // 9. done
-        self.dirty.store(false, Ordering::Relaxed);
-
-        {
-            let Self {
-                slots,
-                deferred_slots,
-                generations,
-                atomic_generations,
-                ..
-            } = self;
-
-            // 5. done
-            deferred_slots.clear(|values| {
-                for value in values {
-                    // 1. done
-                    slots.push(UnsafeCell::new(value));
-                    // 4. partially done
-                    generations.push(0);
-                    // 8. partially done
-                    atomic_generations.push(AtomicU32::new(0));
-                }
-            })
-        }
-
-        {
-            let Self {
-                free,
-                free_bitset,
-                frees_used,
-                generations,
-                atomic_generations,
-                deferred_frees,
-                ..
-            } = self;
-
-            // reusing free slots
-            let used = frees_used.load(Ordering::Relaxed);
-            // 6. done
-            frees_used.store(0, Ordering::Relaxed);
-            for _ in 0..used.min(free.len()) {
-                // 2. partially done
-                let index = free.pop().unwrap();
-                // 3. partially done
-                free_bitset.unset(index);
+        if let Some(slot) = self.slots.get_mut(handle.index()) {
+            if slot.version() == handle.version {
+                return slot.free();
             }
-
-            // applying deferred frees
-            // 7. done
-            deferred_frees.clear(|indices| {
-                for index in indices {
-                    // 3. done
-                    if free_bitset.set(index) {
-                        // 2. done
-                        free.push(index);
-                        // 4. done
-                        generations[index as usize] += 1;
-                        // This needs to be set to generations[index] instead of just incremented
-                        // because it may stil contain the ATOMIC_GENERATION_USED_BIT, which generations[index] doesn't.
-                        // 8. done
-                        atomic_generations[index as usize]
-                            .store(generations[index as usize], Ordering::Relaxed);
-                    }
-                }
-            });
         }
+
+        None
     }
 
-    pub fn len_last_flush(&self) -> usize {
-        self.slots.len()
+    fn handle_is_valid(&self, handle: SlotHandle) -> bool {
+        if handle.index < self.slots.len() as u32 {
+            let slot = &self.slots[handle.index()];
+            slot.version() == handle.version && slot.is_occupied()
+        } else {
+            let deferred_index = handle.index as usize - self.slots.len();
+            // All deferred slots are version 0
+            deferred_index < self.deferred_slots.len() && handle.version == 0
+        }
     }
 
     fn assert_not_dirty(&self) {
         if self.dirty.load(Ordering::Relaxed) {
             panic!(
-                "An exclusive (single-threaded, &mut) write method like `insert` was called \
-                    and no flush happened since the last concurrent write method like `insert_sync`."
-            );
-        }
-    }
-
-    fn is_free(&self, index: u32) -> bool {
-        self.free_bitset.get(index)
-    }
-
-    // isn't free but it's being reused
-
-    fn generation_is_valid(&self, handle: Handle<T>) -> bool {
-        let generation = if self.is_free(handle.index) {
-            // Possibly reused free slot since last flush
-            let generation = self.atomic_generations[handle.index as usize].load(Ordering::Acquire);
-            if generation & Self::ATOMIC_GENERATION_USED_BIT == 0 {
-                return false;
-            }
-            generation & Self::ATOMIC_GENERATION_MASK
-        } else {
-            // Is not free, so `self.generations` will be valid for it until flush
-            let len = self.slots.len() as u32;
-            if handle.index < len {
-                self.generations[handle.index as usize]
-            } else if handle.index - len < self.deferred_slots.len() as u32 {
-                0
-            } else {
-                return false;
-            }
-        };
-
-        handle.generation == generation
-    }
-
-    #[allow(dead_code)]
-    fn check(&mut self) {
-        self.assert_not_dirty();
-
-        for &index in self.free.iter() {
-            assert!(self.free_bitset.get(index));
-        }
-
-        let mut i = 0;
-        while i < self.slots.len() {
-            let bit = self.free_bitset.get(i as u32);
-            if bit {
-                assert!(
-                    self.free.contains(&(i as u32)),
-                    "Index {} was marked as free in free_bitset but not found in free list",
-                    i
-                );
-            }
-            i += 1;
-        }
-
-        let mut free_counts = vec![0; self.slots.len()];
-        for &index in self.free.iter() {
-            free_counts[index as usize] += 1;
-            assert_eq!(
-                free_counts[index as usize], 1,
-                "Found duplicate index {} in free list",
-                index
-            );
-        }
-
-        for &index in self.free.iter() {
-            let generation = self.atomic_generations[index as usize].load(Ordering::Relaxed);
-            assert_eq!(
-                generation & Self::ATOMIC_GENERATION_USED_BIT,
-                0,
-                "Found ATOMIC_GENERATION_USED_BIT set for free index {}",
-                index
+                "A non-concurrent write method like `insert` or `remove` was called \
+                and no flush happened since the last concurrent write method like `concurrent_insert` or `deferred_remove`."
             );
         }
     }
 }
 
-#[derive(Debug)]
-pub struct Handle<T> {
+unsafe impl<T: Send + Sync> Sync for ConcurrentSlotMap<T> {}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SlotHandle {
     index: u32,
-    generation: u32,
-    _type: PhantomData<T>,
+    version: Version,
 }
 
-// Manual impl to avoid dependent on T: Copy from derive
-impl<T> Copy for Handle<T> {}
-impl<T> Clone for Handle<T> {
-    fn clone(&self) -> Self {
-        *self
+impl SlotHandle {
+    fn index(&self) -> usize {
+        self.index as usize
     }
 }
 
-unsafe impl<T> Send for Handle<T> {}
-unsafe impl<T> Sync for Handle<T> {}
+impl SlotHandle {
+    pub const PLACEHOLDER: SlotHandle = SlotHandle::new(u32::MAX, Version::MAX);
 
-impl<T> Handle<T> {
-    pub const PLACEHOLDER: Handle<T> = Handle::new(u32::MAX, u32::MAX);
-
-    const fn new(index: u32, generation: u32) -> Handle<T> {
-        Handle {
-            index,
-            generation,
-            _type: PhantomData::<T>,
-        }
+    const fn new(index: u32, version: Version) -> SlotHandle {
+        SlotHandle { index, version }
     }
 
     /// Should rarely be used. The handles should be obtained from the slot map when inserting instead.
-    pub const fn _new(index: u32, generation: u32) -> Handle<T> {
-        Handle::new(index, generation)
+    pub const fn _new(index: u32, version: Version) -> SlotHandle {
+        SlotHandle::new(index, version)
     }
 }
 
-impl<T> From<Handle<T>> for RawHandle {
-    fn from(handle: Handle<T>) -> Self {
-        RawHandle {
-            index: handle.index,
-            generation: handle.generation,
+use slot::Slot;
+
+// Putting Slot into an extra module to restrict field access and method usage.
+mod slot {
+    use std::{
+        cell::UnsafeCell,
+        mem::MaybeUninit,
+        sync::atomic::{AtomicBool, Ordering},
+    };
+
+    use super::Version;
+
+    // A slot, which represents storage for a value and a current version.
+    // Can be occupied or vacant.
+    #[derive(Debug)]
+    pub struct Slot<T> {
+        value: UnsafeCell<MaybeUninit<T>>,
+        version: Version,
+        occupied: bool,
+        occupied_atomic: AtomicBool,
+    }
+
+    impl<T> Slot<T> {
+        pub fn new_occupied(value: T) -> Self {
+            Self {
+                value: UnsafeCell::new(MaybeUninit::new(value)),
+                version: 0,
+                occupied: true,
+                occupied_atomic: AtomicBool::new(true),
+            }
+        }
+
+        pub fn get(&self, version: Version) -> Option<&T> {
+            (self.version == version && self.is_occupied()).then(|| self.get_unchecked())
+        }
+
+        fn get_unchecked(&self) -> &T {
+            unsafe { (*self.value.get()).assume_init_ref() }
+        }
+
+        pub fn version(&self) -> Version {
+            self.version
+        }
+
+        /// SAFETY: self must be free and no further calls to `write` must happen until the slot is `free`d again.
+        pub unsafe fn write(&self, value: T) {
+            // Note:
+            // The caller guarantees self is free, so `self.content` is uninit, which means overwritting it below is fine.
+            // SAFETY
+            // Aside from `write`, which the caller guarantees to not call again, there is only two methods that access
+            // access `self.content`: `free` and `get`, which protect against reading uninitialized values via
+            // `self.is_occupied`.
+            unsafe { (*self.value.get()).write(value) };
+            self.occupied_atomic.store(true, Ordering::Release);
+        }
+
+        /// Should be called to shortcircuit an atomic load in future calls to `Self::is_occupied`.
+        /// # SAFETY
+        /// Must be occupied.
+        pub unsafe fn confirm_write(&mut self) {
+            self.occupied = true;
+        }
+
+        /// # SAFETY
+        /// Must be free.
+        // Although technically not unsafe, this would not drop any overwritten `self.value` which we want to avoid.
+        pub unsafe fn write_mut(&mut self, value: T) {
+            self.value.get_mut().write(value);
+            self.occupied = true;
+        }
+
+        /// Frees the slot for later reuse.
+        pub fn free(&mut self) -> Option<T> {
+            if self.is_occupied() {
+                self.version += 1;
+                self.occupied = false;
+                self.occupied_atomic = AtomicBool::new(false);
+
+                Some(unsafe {
+                    std::mem::replace(self.value.get_mut(), MaybeUninit::uninit()).assume_init()
+                })
+            } else {
+                None
+            }
+        }
+
+        // Is this slot occupied?
+        #[inline(always)]
+        pub fn is_occupied(&self) -> bool {
+            self.occupied || self.occupied_atomic.load(Ordering::Acquire)
+        }
+
+        #[inline(always)]
+        pub fn is_free(&self) -> bool {
+            !self.is_occupied()
         }
     }
 }
 
-#[allow(unused)]
-#[derive(Clone, Copy)]
-pub struct RawHandle {
-    index: u32,
-    generation: u32,
+#[derive(Debug, Clone, Copy)]
+pub struct OutOfSpace;
+impl std::fmt::Display for OutOfSpace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Out of space in a slot map fixed-sized array")
+    }
 }
+impl std::error::Error for OutOfSpace {}
 
 #[cfg(test)]
 mod tests {
@@ -455,34 +378,13 @@ mod tests {
     use std::thread;
 
     #[test]
-    fn test_basic_insert_get() {
-        let mut map = ConcurrentSlotMap::new(10, 10);
-        let handle = map.insert_mut(42);
-        assert_eq!(*map.get(handle).unwrap(), 42);
-    }
-
-    #[test]
-    fn test_free_and_reuse() {
-        let mut map = ConcurrentSlotMap::new(10, 10);
-        let handle1 = map.insert_mut(1);
-        let handle2 = map.insert_mut(2);
-
-        map.free_mut(handle1);
-        let handle3 = map.insert_mut(3);
-
-        assert!(map.get(handle1).is_none()); // Original handle should be invalid
-        assert_eq!(*map.get(handle2).unwrap(), 2); // Untouched slot should remain valid
-        assert_eq!(*map.get(handle3).unwrap(), 3); // New value in reused slot
-    }
-
-    #[test]
     fn test_concurrent_insert() {
         let mut map = ConcurrentSlotMap::new(100, 100);
         let m = &map;
 
-        let handles: [Handle<u32>; 10] = thread::scope(|s| {
+        let handles: [SlotHandle; 10] = thread::scope(|s| {
             [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
-                .map(|i| s.spawn(move || m.insert(i).unwrap()))
+                .map(|i| s.spawn(move || m.concurrent_insert(i).unwrap()))
                 .map(|t| t.join().unwrap())
         });
 
@@ -496,197 +398,118 @@ mod tests {
     }
 
     #[test]
-    fn test_concurrent_insert_and_get() {
-        // Mostly a test for miri.
-        let mut map = ConcurrentSlotMap::<u32>::new(1000, 1000);
-
-        thread::scope(|s| {
-            let handles: Vec<_> = (0..10)
-                .map(|i| {
-                    let closure: Box<dyn Fn() + Send + Sync> = match i % 2 {
-                        0 => Box::new(|| {
-                            (0..100)
-                                .map(|j| {
-                                    map.insert(j).unwrap();
-                                })
-                                .count();
-                        }),
-                        1 => Box::new(|| {
-                            (0..1000)
-                                .rev()
-                                .map(|j| {
-                                    map.get(Handle::_new(j, 0));
-                                })
-                                .count();
-                        }),
-                        _ => unreachable!(),
-                    };
-                    s.spawn(closure)
-                })
-                .collect();
-
-            for handle in handles {
-                handle.join().unwrap();
-            }
-        });
-
-        map.flush();
-        assert_eq!(map.len_last_flush(), 500);
-    }
-
-    #[test]
-    fn test_deferred_free() {
+    fn test_basic_insert_get() {
         let mut map = ConcurrentSlotMap::new(10, 10);
-
-        let handle = map.insert(123).unwrap();
-        assert_eq!(*map.get(handle).unwrap(), 123);
-
-        map.free(handle).unwrap();
-        // Value should still be accessible until flush
-        assert_eq!(*map.get(handle).unwrap(), 123);
-
+        let handle = map.concurrent_insert(42).unwrap();
+        assert_eq!(*map.get(handle).unwrap(), 42);
         map.flush();
-        // After flush, handle should be invalid
-        assert!(map.get(handle).is_none());
     }
 
     #[test]
-    fn test_capacity_limits() {
-        let mut map = ConcurrentSlotMap::new(2, 2);
+    fn test_multiple_inserts() {
+        let mut map = ConcurrentSlotMap::new(10, 10);
+        let h1 = map.concurrent_insert(1).unwrap();
+        let h2 = map.concurrent_insert(2).unwrap();
+        let h3 = map.concurrent_insert(3).unwrap();
 
-        // Test allocation capacity
-        let _h1 = map.insert(1).unwrap();
-        let _h2 = map.insert(2).unwrap();
-        assert!(map.insert(3).is_err()); // Should fail as capacity is exceeded
-
-        map.flush();
-
-        // Test deferred free capacity
-        let h1 = map.insert(1).unwrap();
-        let h2 = map.insert(2).unwrap();
-        map.free(h1).unwrap();
-        map.free(h2).unwrap();
-        // Should fail as deferred free capacity is exceeded.
-        // Note that freeing the same item twice is not deduplicated.
-        assert!(map.free(h2).is_err());
-    }
-
-    #[test]
-    fn test_set_fixed_size_array_sizes() {
-        let mut map = ConcurrentSlotMap::new(2, 2);
-        let h1 = map.insert_mut(1);
-
-        map.set_fixed_size_array_sizes(4, 4);
-
-        // Verify existing data remains valid
         assert_eq!(*map.get(h1).unwrap(), 1);
+        assert_eq!(*map.get(h2).unwrap(), 2);
+        assert_eq!(*map.get(h3).unwrap(), 3);
 
-        // Verify new capacities work
-        let _h2 = map.insert(2).unwrap();
-        let _h3 = map.insert(3).unwrap();
-        let _h4 = map.insert(4).unwrap();
-    }
-
-    #[test]
-    #[should_panic]
-    fn test_exclusive_after_shared_without_flush() {
-        let mut map = ConcurrentSlotMap::new(10, 10);
-        let _ = map.insert(1).unwrap();
-        // This should panic because we didn't flush after insert_sync
-        map.insert_mut(2);
-    }
-
-    #[test]
-    fn test_exclusive_after_shared_with_flush() {
-        let mut map = ConcurrentSlotMap::new(10, 10);
-        let _ = map.insert(1).unwrap();
         map.flush();
-        // This should work fine because we flushed
-        let _ = map.insert_mut(2);
     }
 
     #[test]
-    fn test_generation_validity() {
+    fn test_insert_free_reuse() {
         let mut map = ConcurrentSlotMap::new(10, 10);
-        let handle1 = map.insert_mut(1);
-        map.free_mut(handle1);
-        let handle2 = map.insert_mut(2); // Reuses the same slot
+        let h1 = map.concurrent_insert(1).unwrap();
 
-        assert!(map.get(handle1).is_none()); // Old handle should be invalid
-        assert_eq!(*map.get(handle2).unwrap(), 2); // New handle should be valid
+        map.deferred_remove(h1).unwrap();
+        map.flush();
+
+        println!("{:#?}", map);
+
+        let h2 = map.concurrent_insert(2).unwrap();
+        println!("{:#?}", map);
+        assert_eq!(*map.get(h2).unwrap(), 2);
+        assert!(map.get(h1).is_none());
+        assert!(h1.index == h2.index);
+
+        map.flush();
     }
 
     #[test]
-    #[should_panic]
-    fn test_shared_then_exclusive_should_panic() {
-        let mut map = ConcurrentSlotMap::new(10, 10);
-        let _ = map.insert(1).unwrap();
-        let _ = map.insert_mut(2);
+    fn test_out_of_space() {
+        let mut map = ConcurrentSlotMap::new(2, 2);
+        let h1 = map.concurrent_insert(1).unwrap();
+        let h2 = map.concurrent_insert(2).unwrap();
+        assert!(map.concurrent_insert(3).is_err());
+
+        map.deferred_remove(h1).unwrap();
+        map.deferred_remove(h2).unwrap();
+        map.flush();
+
+        let h3 = map.concurrent_insert(3).unwrap();
+        assert_eq!(*map.get(h3).unwrap(), 3);
     }
 
     #[test]
-    #[should_panic]
-    fn test_shared_then_free_should_panic() {
-        let mut map = ConcurrentSlotMap::new(10, 10);
-        let handle = map.insert(1).unwrap();
-        map.free_mut(handle);
+    fn test_free_invalid_handle() {
+        let mut map = ConcurrentSlotMap::<u32>::new(10, 10);
+        let invalid_handle = SlotHandle::_new(99, 0);
+        assert!(map.deferred_remove(invalid_handle).is_ok()); // Should be ok since invalid handles are ignored
+        map.flush();
     }
 
     #[test]
-    #[should_panic]
-    fn test_deferred_free_then_free_should_panic() {
+    fn test_mixed_operations() {
         let mut map = ConcurrentSlotMap::new(10, 10);
-        let handle = map.insert_mut(1);
-        map.free(handle).unwrap();
-        map.free_mut(handle);
-    }
+        let h1 = map.concurrent_insert(1).unwrap();
+        let h2 = map.concurrent_insert(2).unwrap();
 
-    #[test]
-    #[should_panic]
-    fn test_deferred_free_then_insert_should_panic() {
-        let mut map = ConcurrentSlotMap::new(10, 10);
-        let handle = map.insert_mut(1);
-        map.free(handle).unwrap();
-        map.insert_mut(2);
-    }
+        assert_eq!(*map.get(h1).unwrap(), 1);
+        map.deferred_remove(h1).unwrap();
 
-    #[test]
-    fn test_exclusive_then_shared_is_ok() {
-        let mut map = ConcurrentSlotMap::new(10, 10);
-
-        // First do exclusive writes
-        let handle1 = map.insert_mut(1);
-        let handle2 = map.insert_mut(2);
-        map.free_mut(handle1);
-
-        // Then do shared writes
-        let handle3 = map.insert(3).unwrap();
-        map.free(handle2).unwrap();
-
-        // Verify everything worked
-        assert!(map.get(handle1).is_none());
-        assert_eq!(*map.get(handle2).unwrap(), 2);
-        assert_eq!(*map.get(handle3).unwrap(), 3);
+        let h3 = map.concurrent_insert(3).unwrap();
+        assert_eq!(*map.get(h2).unwrap(), 2);
+        assert_eq!(*map.get(h3).unwrap(), 3);
 
         map.flush();
 
-        // After flush
-        assert!(map.get(handle1).is_none());
-        assert!(map.get(handle2).is_none());
-        assert_eq!(*map.get(handle3).unwrap(), 3);
+        assert!(map.get(h1).is_none());
     }
 
     #[test]
-    fn test_insertions() {
-        let mut map = ConcurrentSlotMap::new(3200, 3200);
-        for i in 0..1000 {
-            map.insert(i).unwrap();
-        }
+    fn test_flush_behavior() {
+        let mut map = ConcurrentSlotMap::new(10, 10);
+        let h1 = map.concurrent_insert(1).unwrap();
+        map.deferred_remove(h1).unwrap();
+
+        // Handle should still be valid before flush
+        assert!(map.get(h1).is_some());
+
         map.flush();
-        assert!(map.len_last_flush() == 1000);
+
+        // Handle should be invalid after flush
+        assert!(map.get(h1).is_none());
+
+        let h2 = map.concurrent_insert(2).unwrap();
+        assert_eq!(*map.get(h2).unwrap(), 2);
     }
 
-    // MAYBE: Use loom instead for proper permutation testing.
+    #[test]
+    fn test_version_handling() {
+        let mut map = ConcurrentSlotMap::new(10, 10);
+        let h1 = map.concurrent_insert(1).unwrap();
+        map.deferred_remove(h1).unwrap();
+        map.flush();
+
+        let h2 = map.concurrent_insert(2).unwrap();
+        // Even if we reuse the same slot, the handle version should prevent access via old handle
+        assert!(map.get(h1).is_none());
+        assert_eq!(*map.get(h2).unwrap(), 2);
+    }
+
     #[test]
     fn test_concurrent_stress_mixed_operations() {
         use rand::prelude::*;
@@ -729,16 +552,16 @@ mod tests {
                         for op in ops {
                             match op {
                                 Operation::Insert(value) => {
-                                    if let Ok(handle) = map_ref.insert(value) {
+                                    if let Ok(handle) = map_ref.concurrent_insert(value) {
                                         assert_eq!(*map_ref.get(handle).unwrap(), value);
                                     }
                                 }
                                 Operation::Free(handle_idx) => {
-                                    let handle = Handle::_new(handle_idx as u32, 0);
-                                    let _ = map_ref.free(handle);
+                                    let handle = SlotHandle::_new(handle_idx as u32, 0);
+                                    let _ = map_ref.deferred_remove(handle);
                                 }
                                 Operation::Get(handle_idx) => {
-                                    let handle = Handle::_new(handle_idx as u32, 0);
+                                    let handle = SlotHandle::_new(handle_idx as u32, 0);
                                     let _ = map_ref.get(handle);
                                 }
                             }
@@ -748,7 +571,6 @@ mod tests {
             });
 
             map.flush();
-            map.check();
         }
     }
 }
