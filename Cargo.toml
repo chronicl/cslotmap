@@ -14,10 +14,6 @@ rust-lockless-slotmap = "0.1.4"
 slotmap = "1.0.7"
 
 [[bench]]
-name = "multithreaded2"
-harness = false
-
-[[bench]]
 name = "multithreaded"
 harness = false
 
