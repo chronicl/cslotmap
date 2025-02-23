@@ -66,6 +66,10 @@ impl<T> BumpVec<T> {
             .min(self.data.len())
     }
 
+    pub fn iter(&self) -> impl Iterator<Item = &T> {
+        (0..self.len()).filter_map(|i| self.get(i))
+    }
+
     pub fn clear<R>(&mut self, values_fn: impl FnOnce(&mut dyn Iterator<Item = T>) -> R) -> R {
         let mut iter = (0..self.len()).map(|i| {
             // Sync 1

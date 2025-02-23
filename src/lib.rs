@@ -1,7 +1,25 @@
-//! # A slot map with support for concurrent lock-less operations.
-//! Aside from offering the usual slot map API, this slot map offers two concurrent lock-less operations:
-//! [`concurrent_insert`](ConcurrentSlotMap::concurrent_insert) and [`deferred_remove`](ConcurrentSlotMap::deferred_remove).
-
+/// # A slot map with support for concurrent lock-less operations.
+/// Aside from offering the usual slot map API, this slot map offers two concurrent lock-less operations:
+/// [`concurrent_insert`](ConcurrentSlotMap::concurrent_insert) and [`deferred_remove`](ConcurrentSlotMap::deferred_remove).
+///
+/// Once a concurrent method has been used, the slot map is marked as dirty and other write methods
+/// like [`insert`](ConcurrentSlotMap::insert) and [`remove`](ConcurrentSlotMap::remove) become unavailable until
+/// [`flush`](ConcurrentSlotMap::flush) is called. Read methods like [`get`](ConcurrentSlotMap::get) and
+/// [`iter`](ConcurrentSlotMap::iter) remain available.
+///
+/// However, there is a configurable limit to how many `concurrent_insert` and `deferred_remove` operations can occur
+/// in between each `flush`. The limit must be configured when creating the slot map with [`ConcurrentSlotMap::new`] and
+/// can later be changed via [`ConcurrentSlotMap::set_concurrent_insert_capacity`] and [`ConcurrentSlotMap::set_deferred_remove_capacity`].
+///
+/// ## Performance
+/// The non-concurrent methods are comparable in performance to `SlotMap` from the [`slotmap`](https://docs.rs/slotmap/latest/slotmap/) crate.
+///
+/// In single-threaded usage the concurrent methods are roughly 2 to 4 times slower than their non-concurrent counterparts.
+///
+/// I have benchmarked against other concurrent slotmap implementations (which have different trade-offs)
+/// and this implementation has better performance by 2-20 times across the board.
+///
+/// These measurements are heavily hardware dependent. Benchmark code can be found in the github repo.
 use bumpvec::BumpVec;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -28,8 +46,7 @@ type Version = u32;
 /// In single-threaded usage the concurrent methods are roughly 2 to 4 times slower than their non-concurrent counterparts.
 ///
 /// I have benchmarked against other concurrent slotmap implementations (which have different trade-offs)
-/// and this implementation has better performance by 2-10 times across the board, expect `deferred_free` where
-/// it is 50% slower than the fastest implementation.
+/// and this implementation has better performance by 2-20 times across the board.
 ///
 /// These measurements are heavily hardware dependent. Benchmark code can be found in the github repo.
 #[derive(Debug)]
@@ -214,6 +231,13 @@ impl<T> ConcurrentSlotMap<T> {
         }
 
         None
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &T> {
+        self.slots
+            .iter()
+            .filter_map(|slot| slot.get(slot.version()))
+            .chain(self.deferred_slots.iter())
     }
 
     fn handle_is_valid(&self, handle: SlotHandle) -> bool {
@@ -510,6 +534,96 @@ mod tests {
         assert_eq!(*map.get(h2).unwrap(), 2);
     }
 
+    #[test]
+    #[should_panic]
+    fn test_exclusive_after_shared_without_flush() {
+        let mut map = ConcurrentSlotMap::new(10, 10);
+        let _ = map.concurrent_insert(1).unwrap();
+        // This should panic because we didn't flush after insert_sync
+        map.insert(2);
+    }
+
+    #[test]
+    fn test_exclusive_after_shared_with_flush() {
+        let mut map = ConcurrentSlotMap::new(10, 10);
+        let _ = map.concurrent_insert(1).unwrap();
+        map.flush();
+        // This should work fine because we flushed
+        let _ = map.insert(2);
+    }
+
+    #[test]
+    fn test_generation_validity() {
+        let mut map = ConcurrentSlotMap::new(10, 10);
+        let handle1 = map.insert(1);
+        map.remove(handle1);
+        let handle2 = map.insert(2); // Reuses the same slot
+
+        assert!(map.get(handle1).is_none()); // Old handle should be invalid
+        assert_eq!(*map.get(handle2).unwrap(), 2); // New handle should be valid
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_shared_then_exclusive_should_panic() {
+        let mut map = ConcurrentSlotMap::new(10, 10);
+        let _ = map.concurrent_insert(1).unwrap();
+        let _ = map.insert(2);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_shared_then_free_should_panic() {
+        let mut map = ConcurrentSlotMap::new(10, 10);
+        let handle = map.concurrent_insert(1).unwrap();
+        map.remove(handle);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_deferred_free_then_free_should_panic() {
+        let mut map = ConcurrentSlotMap::new(10, 10);
+        let handle = map.insert(1);
+        map.deferred_remove(handle).unwrap();
+        map.remove(handle);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_deferred_free_then_insert_should_panic() {
+        let mut map = ConcurrentSlotMap::new(10, 10);
+        let handle = map.insert(1);
+        map.deferred_remove(handle).unwrap();
+        map.insert(2);
+    }
+
+    #[test]
+    fn test_exclusive_then_shared_is_ok() {
+        let mut map = ConcurrentSlotMap::new(10, 10);
+
+        // First do exclusive writes
+        let handle1 = map.insert(1);
+        let handle2 = map.insert(2);
+        map.remove(handle1);
+
+        // Then do shared writes
+        let handle3 = map.concurrent_insert(3).unwrap();
+        map.deferred_remove(handle2).unwrap();
+
+        // Verify everything worked
+        assert!(map.get(handle1).is_none());
+        assert_eq!(*map.get(handle2).unwrap(), 2);
+        assert_eq!(*map.get(handle3).unwrap(), 3);
+
+        map.flush();
+
+        // After flush
+        assert!(map.get(handle1).is_none());
+        assert!(map.get(handle2).is_none());
+        assert_eq!(*map.get(handle3).unwrap(), 3);
+    }
+
+    // TODO: use loom for more guaranteed tests
     #[test]
     fn test_concurrent_stress_mixed_operations() {
         use rand::prelude::*;
