@@ -6,4 +6,17 @@ edition = "2024"
 [dependencies]
 
 [dev-dependencies]
+concurrent-slotmap = "0.1.0-alpha.2"
+divan = "0.1.17"
+parking_lot = "0.12.3"
 rand = "0.9.0"
+rust-lockless-slotmap = "0.1.4"
+slotmap = "1.0.7"
+
+[[bench]]
+name = "multithreaded"
+harness = false
+
+[[bench]]
+name = "singlethreaded"
+harness = false

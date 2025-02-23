@@ -1,30 +1,32 @@
-use std::cell::UnsafeCell;
-use std::fmt;
 use std::marker::PhantomData;
-use std::mem::ManuallyDrop;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::bumpvec::BumpVec;
 
-type Version = u16;
+type Version = u32;
 
 #[derive(Debug)]
 pub struct DeferredSlotMap<T> {
     slots: Vec<Slot<T>>,
-    free_head: AtomicU32,
+
+    free: Vec<u32>,
+    frees_used: AtomicUsize,
 
     deferred_slots: BumpVec<T>,
     deferred_frees: BumpVec<u32>,
     dirty: AtomicBool,
 }
 
-impl<T> DeferredSlotMap<T> {
-    const INVALID_FREE: u32 = u32::MAX;
+const INVALID_FREE: u32 = u32::MAX;
 
+impl<T> DeferredSlotMap<T> {
     pub fn new(allocation_capacity: usize, deferred_frees_capacity: usize) -> Self {
         Self {
             slots: Default::default(),
-            free_head: AtomicU32::new(Self::INVALID_FREE),
+
+            free: Default::default(),
+            frees_used: AtomicUsize::new(0),
 
             deferred_slots: BumpVec::new(allocation_capacity),
             deferred_frees: BumpVec::new(deferred_frees_capacity),
@@ -38,14 +40,7 @@ impl<T> DeferredSlotMap<T> {
             self.deferred_slots.get(index - self.slots.len())
         } else {
             let slot = &self.slots[index];
-            if slot.version == handle.version {
-                match slot.get() {
-                    Occupied(value) => Some(value),
-                    _ => None,
-                }
-            } else {
-                None
-            }
+            slot.get(handle.version)
         }
     }
 
@@ -67,23 +62,9 @@ impl<T> DeferredSlotMap<T> {
     }
 
     fn reserve_free_slot(&self) -> Option<u32> {
-        let mut curr = self.free_head.load(Ordering::Relaxed);
-        while curr != Self::INVALID_FREE {
-            let old = curr;
-            assert!(self.slots[curr as usize].is_free());
-            match self.free_head.compare_exchange_weak(
-                old,
-                unsafe { self.slots[curr as usize].u.next_free },
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => {
-                    return Some(curr);
-                }
-                Err(new) => curr = new,
-            }
-        }
-        None
+        let frees_used = self.frees_used.fetch_add(1, Ordering::Relaxed);
+        let len = self.free.len();
+        (frees_used < len).then(|| self.free[len - 1 - frees_used])
     }
 
     /// Returns the generation of the slot.
@@ -99,16 +80,15 @@ impl<T> DeferredSlotMap<T> {
         // SAFETY: See above.
         // Reads are secured by slot.occupied_atomic
         // TODO: maybe have to free AtomicU32 here
-        unsafe { (*slot.u.value).get().write(value) };
-        slot.occupied_atomic.store(true, Ordering::Release);
+        unsafe { slot.write(value) };
 
-        slot.version
+        slot.version()
     }
 
     fn handle_is_valid(&self, handle: Handle<T>) -> bool {
         if handle.index < self.slots.len() as u32 {
             let slot = &self.slots[handle.index()];
-            slot.version == handle.version && slot.is_occupied()
+            slot.version() == handle.version && slot.is_occupied()
         } else {
             let deferred_index = handle.index as usize - self.slots.len();
             // All deferred slots are version 0
@@ -135,7 +115,8 @@ impl<T> DeferredSlotMap<T> {
 
         let Self {
             slots,
-            free_head,
+            free,
+            frees_used,
             deferred_slots,
             deferred_frees,
             ..
@@ -148,25 +129,24 @@ impl<T> DeferredSlotMap<T> {
             }
         });
 
-        let head = &mut free_head.load(Ordering::Relaxed);
+        // Removing reused frees from `free` and updating the non-atomic
+        let used = frees_used.load(Ordering::Relaxed);
+        frees_used.store(0, Ordering::Relaxed);
+        for _ in 0..used.min(free.len()) {
+            let index = free.pop().unwrap();
+            // SAFETY: We just popped it from `free`, which means it was reused/occupied since last flush.
+            unsafe { slots[index as usize].confirm_write() };
+        }
+
         // Appying deferred frees
-        let r = deferred_frees.clear(|indices| {
+        deferred_frees.clear(|indices| {
             let mut values = indices.flat_map(|index| {
-                let slot = &mut slots[index as usize];
-                // The same index maybe occur multiple times in deferred frees, so it could already be freed here
-                if slot.is_occupied_mut() {
-                    let value = unsafe { ManuallyDrop::take(&mut slot.u.value) };
-
-                    slot.u.next_free = *head;
-                    *head = index;
-                    slot.version += 1;
-                    slot.occupied = false;
-                    slot.occupied_atomic = AtomicBool::new(false);
-
-                    Some(value.into_inner())
-                } else {
-                    None
+                let value = slots[index as usize].free();
+                // Only freeing if the slot wasn't already free
+                if value.is_some() {
+                    free.push(index);
                 }
+                value
             });
 
             let r = free_fn(&mut values);
@@ -174,10 +154,7 @@ impl<T> DeferredSlotMap<T> {
             values.count();
 
             r
-        });
-        *free_head = AtomicU32::new(*head);
-
-        r
+        })
     }
 }
 
@@ -224,83 +201,103 @@ impl<T> Handle<T> {
     }
 }
 
-// A slot, which represents storage for a value and a current version.
-// Can be occupied or vacant.
-struct Slot<T> {
-    u: SlotUnion<T>,
-    version: Version,
-    occupied: bool,
-    occupied_atomic: AtomicBool,
-}
+use slot::Slot;
 
-// Storage inside a slot or metadata for the freelist when vacant.
-union SlotUnion<T> {
-    value: ManuallyDrop<UnsafeCell<T>>,
-    next_free: u32,
-}
+// Putting Slot into an extra module to restrict method usage.
+mod slot {
+    use std::{
+        cell::UnsafeCell,
+        mem::MaybeUninit,
+        sync::atomic::{AtomicBool, Ordering},
+    };
 
-// Safe API to read a slot.
-enum SlotContent<'a, T: 'a> {
-    Occupied(&'a T),
-    Vacant(u32),
-}
+    use super::Version;
 
-use self::SlotContent::{Occupied, Vacant};
-
-impl<T> Slot<T> {
-    pub fn new_occupied(value: T) -> Self {
-        Self {
-            u: SlotUnion {
-                value: ManuallyDrop::new(UnsafeCell::new(value)),
-            },
-            version: 0,
-            occupied: true,
-            occupied_atomic: AtomicBool::new(true),
-        }
+    // A slot, which represents storage for a value and a current version.
+    // Can be occupied or vacant.
+    #[derive(Debug)]
+    pub struct Slot<T> {
+        value: UnsafeCell<MaybeUninit<T>>,
+        version: Version,
+        occupied: bool,
+        occupied_atomic: AtomicBool,
     }
 
-    // Is this slot occupied?
-    #[inline(always)]
-    pub fn is_occupied(&self) -> bool {
-        self.occupied || self.occupied_atomic.load(Ordering::Acquire)
-    }
-
-    pub fn is_occupied_mut(&mut self) -> bool {
-        self.occupied
-    }
-
-    #[inline(always)]
-    pub fn is_free(&self) -> bool {
-        !self.is_occupied()
-    }
-
-    pub fn get(&self) -> SlotContent<T> {
-        if self.is_occupied() {
-            Occupied(unsafe { &*self.u.value.get() })
-        } else {
-            Vacant(unsafe { self.u.next_free })
-        }
-    }
-}
-
-impl<T> Drop for Slot<T> {
-    fn drop(&mut self) {
-        if core::mem::needs_drop::<T>() && self.is_occupied() {
-            // This is safe because we checked that we're occupied.
-            unsafe {
-                ManuallyDrop::drop(&mut self.u.value);
+    impl<T> Slot<T> {
+        pub fn new_occupied(value: T) -> Self {
+            Self {
+                value: UnsafeCell::new(MaybeUninit::new(value)),
+                version: 0,
+                occupied: true,
+                occupied_atomic: AtomicBool::new(true),
             }
         }
-    }
-}
 
-impl<T: fmt::Debug> fmt::Debug for Slot<T> {
-    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
-        let mut builder = fmt.debug_struct("Slot");
-        builder.field("version", &self.version);
-        match self.get() {
-            Occupied(value) => builder.field("value", value).finish(),
-            Vacant(next_free) => builder.field("next_free", &next_free).finish(),
+        pub fn get(&self, version: Version) -> Option<&T> {
+            (self.version == version && self.is_occupied()).then(|| self.get_unchecked())
+        }
+
+        fn get_unchecked(&self) -> &T {
+            unsafe { (*self.value.get()).assume_init_ref() }
+        }
+
+        pub fn version(&self) -> Version {
+            self.version
+        }
+
+        /// SAFETY: self must be free and no further calls to `write` must happen until the slot is `free`d again.
+        pub unsafe fn write(&self, value: T) {
+            // Note:
+            // The caller guarantees self is free, so `self.content` is uninit, which means overwritting it below is fine.
+            // SAFETY
+            // Aside from `write`, which the caller guarantees to not call again, there is only two methods that access
+            // access `self.content`: `free` and `get`, which protect against reading uninitialized values via
+            // `self.is_occupied`.
+            unsafe { (*self.value.get()).write(value) };
+            self.occupied_atomic.store(true, Ordering::Release);
+        }
+
+        /// Should be called to shortcircuit an atomic load in future calls to `Self::is_occupied`.
+        /// # SAFETY
+        /// Must be occupied.
+        pub unsafe fn confirm_write(&mut self) {
+            self.occupied = true;
+        }
+
+        /// # SAFETY
+        /// Must be free.
+        // Although technically not unsafe, this would not drop any overwritten `self.value` which we want to avoid.
+        pub unsafe fn write_mut(&mut self, value: T) {
+            self.value.get_mut().write(value);
+            self.occupied = true;
+        }
+
+        /// Frees the slot for later reuse and stores next_free.
+        ///
+        /// Returns None if self is not occupied. In that case next_free isn't stored.
+        pub fn free(&mut self) -> Option<T> {
+            if self.is_occupied() {
+                self.version += 1;
+                self.occupied = false;
+                self.occupied_atomic = AtomicBool::new(false);
+
+                Some(unsafe {
+                    std::mem::replace(self.value.get_mut(), MaybeUninit::uninit()).assume_init()
+                })
+            } else {
+                None
+            }
+        }
+
+        // Is this slot occupied?
+        #[inline(always)]
+        pub fn is_occupied(&self) -> bool {
+            self.occupied || self.occupied_atomic.load(Ordering::Acquire)
+        }
+
+        #[inline(always)]
+        pub fn is_free(&self) -> bool {
+            !self.is_occupied()
         }
     }
 }

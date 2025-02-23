@@ -9,7 +9,7 @@ use bumpvec::BumpVec;
 
 mod bitset;
 mod bumpvec;
-mod new;
+pub mod new;
 
 /// ## A (mostly) lock-less concurrent slot map.
 ///
@@ -181,7 +181,7 @@ impl<T> ConcurrentSlotMap<T> {
 
     /// ### Panics
     /// A shared write method like `insert_sync` has been called since the last `flush`.
-    pub fn free_mut(&mut self, handle: Handle<T>) {
+    pub fn free_mut(&mut self, handle: Handle<T>) -> bool {
         self.assert_not_dirty();
 
         let was_not_already_free = self.free_bitset.set(handle.index);
@@ -191,6 +191,7 @@ impl<T> ConcurrentSlotMap<T> {
             self.generations[i] += 1;
             self.atomic_generations[i].store(self.generations[i], Ordering::Relaxed);
         }
+        was_not_already_free
     }
 
     fn reserve_free_slot(&self) -> Option<u32> {
