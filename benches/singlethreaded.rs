@@ -8,6 +8,55 @@ fn main() {
     divan::main();
 }
 
+#[divan::bench(types = [slotmap::SlotMap<slotmap::DefaultKey, u32>, ConcurrentSlotMap<u32>, ConcurrentSlotMapWithConcurrentOperations<u32>], threads = [1, 4, 16], args = LENS)]
+fn get_sequential<M: Map<u32>>(bencher: Bencher, len: usize) {
+    let mut map = M::new();
+    let handles: Vec<_> = (0..len).map(|i| map.insert(i as u32)).collect();
+
+    bencher.bench(|| {
+        for handle in handles.iter() {
+            black_box(map.get(black_box(*handle)));
+        }
+    })
+}
+
+#[divan::bench(types = [slotmap::SlotMap<slotmap::DefaultKey, u32>, ConcurrentSlotMap<u32>, ConcurrentSlotMapWithConcurrentOperations<u32>], threads = [1, 4, 16], args = LENS)]
+fn get_random<M: Map<u32>>(bencher: Bencher, len: usize) {
+    let mut map = M::new();
+    let mut handles: Vec<_> = (0..len).map(|i| map.insert(i as u32)).collect();
+    handles.shuffle(&mut rand::rng());
+
+    bencher.bench(|| {
+        for handle in handles.iter() {
+            black_box(map.get(black_box(*handle)));
+        }
+    })
+}
+
+#[divan::bench(types = [slotmap::SlotMap<slotmap::DefaultKey, u32>, ConcurrentSlotMap<u32>, ConcurrentSlotMapWithConcurrentOperations<u32>], args = LENS)]
+fn insert<M: Map<u32>>(bencher: Bencher, len: usize) {
+    bencher.with_inputs(|| M::new()).bench_values(|mut map| {
+        for i in 0..len {
+            black_box(map.insert(black_box(i as u32)));
+        }
+    })
+}
+
+#[divan::bench(types = [slotmap::SlotMap<slotmap::DefaultKey, u32>, ConcurrentSlotMap<u32>, ConcurrentSlotMapWithConcurrentOperations<u32>], args = LENS)]
+fn remove<M: Map<u32>>(bencher: Bencher, len: usize) {
+    bencher
+        .with_inputs(|| {
+            let mut map = M::new();
+            let handles: Vec<_> = (0..len).map(|i| map.insert(i as u32)).collect();
+            (map, handles)
+        })
+        .bench_values(|(mut map, handles)| {
+            for handle in handles.iter() {
+                black_box(map.remove(black_box(*handle)));
+            }
+        })
+}
+
 trait Map<T>: Send + Sync {
     type Handle: Send + Sync + Copy;
 
@@ -81,53 +130,4 @@ impl<T: Send + Sync + Copy> Map<T> for slotmap::SlotMap<slotmap::DefaultKey, T> 
     fn remove(&mut self, handle: Self::Handle) -> Option<T> {
         self.remove(handle)
     }
-}
-
-#[divan::bench(types = [slotmap::SlotMap<slotmap::DefaultKey, u32>, ConcurrentSlotMap<u32>, ConcurrentSlotMapWithConcurrentOperations<u32>], threads = [1, 4, 16], args = LENS)]
-fn get_sequential<M: Map<u32>>(bencher: Bencher, len: usize) {
-    let mut map = M::new();
-    let handles: Vec<_> = (0..len).map(|i| map.insert(i as u32)).collect();
-
-    bencher.bench(|| {
-        for handle in handles.iter() {
-            black_box(map.get(black_box(*handle)));
-        }
-    })
-}
-
-#[divan::bench(types = [slotmap::SlotMap<slotmap::DefaultKey, u32>, ConcurrentSlotMap<u32>, ConcurrentSlotMapWithConcurrentOperations<u32>], threads = [1, 4, 16], args = LENS)]
-fn get_random<M: Map<u32>>(bencher: Bencher, len: usize) {
-    let mut map = M::new();
-    let mut handles: Vec<_> = (0..len).map(|i| map.insert(i as u32)).collect();
-    handles.shuffle(&mut rand::rng());
-
-    bencher.bench(|| {
-        for handle in handles.iter() {
-            black_box(map.get(black_box(*handle)));
-        }
-    })
-}
-
-#[divan::bench(types = [slotmap::SlotMap<slotmap::DefaultKey, u32>, ConcurrentSlotMap<u32>, ConcurrentSlotMapWithConcurrentOperations<u32>], args = LENS)]
-fn insert<M: Map<u32>>(bencher: Bencher, len: usize) {
-    bencher.with_inputs(|| M::new()).bench_values(|mut map| {
-        for i in 0..len {
-            black_box(map.insert(black_box(i as u32)));
-        }
-    })
-}
-
-#[divan::bench(types = [slotmap::SlotMap<slotmap::DefaultKey, u32>, ConcurrentSlotMap<u32>, ConcurrentSlotMapWithConcurrentOperations<u32>], args = LENS)]
-fn remove<M: Map<u32>>(bencher: Bencher, len: usize) {
-    bencher
-        .with_inputs(|| {
-            let mut map = M::new();
-            let handles: Vec<_> = (0..len).map(|i| map.insert(i as u32)).collect();
-            (map, handles)
-        })
-        .bench_values(|(mut map, handles)| {
-            for handle in handles.iter() {
-                black_box(map.remove(black_box(*handle)));
-            }
-        })
 }
