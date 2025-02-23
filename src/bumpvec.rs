@@ -182,7 +182,7 @@ mod tests {
         // Verify that all successfully pushed values can be retrieved
         let mut count = 0;
         for i in 0..vec.len() {
-            if let Some(_) = vec.get(i) {
+            if vec.get(i).is_some() {
                 count += 1;
             }
         }

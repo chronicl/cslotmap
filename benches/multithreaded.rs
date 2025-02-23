@@ -144,6 +144,7 @@ fn new_mixed_operations<M: Map<u32>>(
     }
 }
 
+#[allow(clippy::type_complexity)]
 fn mixed_operations<M: Map<u32>>(_: usize) -> impl Fn(&(M, Vec<Vec<Operation<M::Handle>>>), u32) {
     move |(map, ops), thread_id| {
         let ops = &ops[thread_id as usize];
@@ -182,7 +183,7 @@ fn insert<M: Map<u32>>(len: usize) -> impl Fn(&M, u32) {
     }
 }
 
-fn remove<M: Map<u32>>(len: usize) -> impl Fn(&(M, Vec<M::Handle>), u32) {
+fn remove<M: Map<u32>>(_: usize) -> impl Fn(&(M, Vec<M::Handle>), u32) {
     move |(map, handles), _| {
         let pin = map.pin();
         for handle in handles {
