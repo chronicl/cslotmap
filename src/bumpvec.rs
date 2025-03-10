@@ -6,6 +6,8 @@ use std::{
 
 // TODO: should be renamed
 pub struct BumpVec<T> {
+    // Could consider to merge these two Box<[]>, but would increase memory usage for T that don't
+    // have padding bytes for alignment.
     data: Box<[UnsafeCell<MaybeUninit<T>>]>,
     guards: Box<[AtomicBool]>,
     max_allocated: AtomicUsize,
@@ -94,8 +96,9 @@ impl<T> Drop for BumpVec<T> {
         let len = self.max_allocated.load(Ordering::Relaxed);
         for i in 0..len.min(self.data.len()) {
             // Sync 1
-            // This should always be the case. The only time the guard isn't true for i < len.min(self.data.len())
-            // is in the push method, which takes &self, but here we have &mut self, so push must not be running at the same time
+            // This should always be the case. The only time the guard isn't true for i <
+            // len.min(self.data.len()) is in the push method, which takes &self, but
+            // here we have &mut self, so push must not be running at the same time
             assert!(self.guards[i].load(Ordering::Acquire));
             let data = self.data[i].get_mut();
             unsafe {
