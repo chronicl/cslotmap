@@ -1,54 +1,65 @@
 /// # A slot map with support for concurrent lock-less operations.
-/// Aside from offering the usual slot map API, this slot map offers two concurrent lock-less operations:
-/// [`concurrent_insert`](ConcurrentSlotMap::concurrent_insert) and [`deferred_remove`](ConcurrentSlotMap::deferred_remove).
+/// Aside from offering the usual slot map API, this slot map offers two concurrent lock-less
+/// operations: [`concurrent_insert`](ConcurrentSlotMap::concurrent_insert) and
+/// [`deferred_remove`](ConcurrentSlotMap::deferred_remove).
 ///
-/// Once a concurrent method has been used, the slot map is marked as dirty and other write methods
-/// like [`insert`](ConcurrentSlotMap::insert) and [`remove`](ConcurrentSlotMap::remove) become unavailable until
-/// [`flush`](ConcurrentSlotMap::flush) is called. Read methods like [`get`](ConcurrentSlotMap::get) and
-/// [`iter`](ConcurrentSlotMap::iter) remain available.
+/// Once a concurrent method has been used, the slot map is marked as dirty and other write
+/// methods like [`insert`](ConcurrentSlotMap::insert) and
+/// [`remove`](ConcurrentSlotMap::remove) become unavailable until
+/// [`flush`](ConcurrentSlotMap::flush) is called. Read methods like
+/// [`get`](ConcurrentSlotMap::get) and [`iter`](ConcurrentSlotMap::iter) remain available.
 ///
-/// However, there is a configurable limit to how many `concurrent_insert` and `deferred_remove` operations can occur
-/// in between each `flush`. The limit must be configured when creating the slot map with [`ConcurrentSlotMap::new`] and
-/// can later be changed via [`ConcurrentSlotMap::set_concurrent_insert_capacity`] and [`ConcurrentSlotMap::set_deferred_remove_capacity`].
+/// However, there is a configurable limit to how many `concurrent_insert` and
+/// `deferred_remove` operations can occur in between each `flush`. The limit must be
+/// configured when creating the slot map with [`ConcurrentSlotMap::new`] and can later be
+/// changed via [`ConcurrentSlotMap::set_concurrent_insert_capacity`] and
+/// [`ConcurrentSlotMap::set_deferred_remove_capacity`].
 ///
 /// ## Performance
 /// The non-concurrent methods are comparable in performance to `SlotMap` from the [`slotmap`](https://docs.rs/slotmap/latest/slotmap/) crate.
 ///
-/// In single-threaded usage the concurrent methods are roughly 2 to 4 times slower than their non-concurrent counterparts.
+/// In single-threaded usage the concurrent methods are roughly 2 to 4 times slower than their
+/// non-concurrent counterparts.
 ///
-/// I have benchmarked against other concurrent slotmap implementations (which have different trade-offs)
-/// and this implementation has better performance by 2-20 times across the board.
+/// I have benchmarked against other concurrent slotmap implementations (which have different
+/// trade-offs) and this implementation has better performance by 2-20 times across the board.
 ///
-/// These measurements are heavily hardware dependent. Benchmark code can be found in the github repo.
+/// These measurements are heavily hardware dependent. Benchmark code can be found in the
+/// github repo.
 use bumpvec::BumpVec;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-mod bumpvec;
+pub mod bumpvec;
 
 type Version = u32;
 
 /// # A slot map with support for concurrent lock-less operations.
-/// Aside from offering the usual slot map API, this slot map offers two concurrent lock-less operations:
-/// [`concurrent_insert`](ConcurrentSlotMap::concurrent_insert) and [`deferred_remove`](ConcurrentSlotMap::deferred_remove).
+/// Aside from offering the usual slot map API, this slot map offers two concurrent lock-less
+/// operations: [`concurrent_insert`](ConcurrentSlotMap::concurrent_insert) and
+/// [`deferred_remove`](ConcurrentSlotMap::deferred_remove).
 ///
 /// Once a concurrent method has been used, the slot map is marked as dirty and other write methods
-/// like [`insert`](ConcurrentSlotMap::insert) and [`remove`](ConcurrentSlotMap::remove) become unavailable until
-/// [`flush`](ConcurrentSlotMap::flush) is called. Read methods like [`get`](ConcurrentSlotMap::get) and
-/// [`iter`](ConcurrentSlotMap::iter) remain available.
+/// like [`insert`](ConcurrentSlotMap::insert) and [`remove`](ConcurrentSlotMap::remove) become
+/// unavailable until [`flush`](ConcurrentSlotMap::flush) is called. Read methods like
+/// [`get`](ConcurrentSlotMap::get) and [`iter`](ConcurrentSlotMap::iter) remain available.
 ///
-/// However, there is a configurable limit to how many `concurrent_insert` and `deferred_remove` operations can occur
-/// in between each `flush`. The limit must be configured when creating the slot map with [`ConcurrentSlotMap::new`] and
-/// can later be changed via [`ConcurrentSlotMap::set_concurrent_insert_capacity`] and [`ConcurrentSlotMap::set_deferred_remove_capacity`].
+/// However, there is a configurable limit to how many `concurrent_insert` and `deferred_remove`
+/// operations can occur in between each `flush`. The limit must be configured when creating the
+/// slot map with [`ConcurrentSlotMap::new`] and can later be changed via
+/// [`ConcurrentSlotMap::set_concurrent_insert_capacity`] and
+/// [`ConcurrentSlotMap::set_deferred_remove_capacity`].
 ///
 /// ## Performance
 /// The non-concurrent methods are comparable in performance to `SlotMap` from the [`slotmap`](https://docs.rs/slotmap/latest/slotmap/) crate.
 ///
-/// In single-threaded usage the concurrent methods are roughly 2 to 4 times slower than their non-concurrent counterparts.
+/// In single-threaded usage the concurrent methods are roughly 2 to 4 times slower than their
+/// non-concurrent counterparts.
 ///
-/// I have benchmarked against other concurrent slotmap implementations (which have different trade-offs)
-/// and this implementation has better performance by 2-20 times across the board.
+/// I have benchmarked against other concurrent slotmap implementations (which have different
+/// trade-offs) and this implementation has better performance by 2-20 times across the board.
 ///
-/// These measurements are heavily hardware dependent. Benchmark code can be found in the github repo.
+/// These measurements are heavily hardware dependent. Benchmark code can be found in the github
+/// repo.
 #[derive(Debug)]
 pub struct ConcurrentSlotMap<T> {
     slots: Vec<Slot<T>>,
@@ -66,11 +77,13 @@ impl<T> ConcurrentSlotMap<T> {
     /// Inserts a new item into the map. The item is immediately accessible by all threads.
     pub fn concurrent_insert(&self, value: T) -> Result<SlotHandle, OutOfSpace> {
         let (index, version) = if let Some(index) = self.reserve_free_slot() {
-            // SAFETY: index was reserved via `reserve_free_slot`. self is marked as dirty in this method.
+            // SAFETY: index was reserved via `reserve_free_slot`. self is marked as dirty in this
+            // method.
             let generation = unsafe { self.write_to_reserved_slot(index, value) };
             (index, generation)
         } else if let Some(index) = self.deferred_slots.push(value) {
-            // deferred_slots will be appeneded to slots upon calling flush, so the handle index is actually self.slots.len() + index
+            // deferred_slots will be appeneded to slots upon calling flush, so the handle index is
+            // actually self.slots.len() + index
             ((self.slots.len() + index) as u32, 0)
         } else {
             return Err(OutOfSpace);
@@ -121,7 +134,8 @@ impl<T> ConcurrentSlotMap<T> {
         frees_used.store(0, Ordering::Relaxed);
         for _ in 0..used.min(free.len()) {
             let index = free.pop().unwrap();
-            // SAFETY: We just popped it from `free`, which means it was reused/occupied since last flush.
+            // SAFETY: We just popped it from `free`, which means it was reused/occupied since last
+            // flush.
             unsafe { slots[index as usize].confirm_write() };
         }
 
@@ -154,8 +168,8 @@ impl<T> ConcurrentSlotMap<T> {
     /// SAFETY:
     /// index must have previously been reserved via `reserve_free_slot`, so that no other
     /// shared write method can possibly use the same free slot.
-    /// self must be marked as dirty, so that no exclusive write method can possibly use the free slot, because
-    /// exclusive write methods can't be used as long as self is dirty.
+    /// self must be marked as dirty, so that no exclusive write method can possibly use the free
+    /// slot, because exclusive write methods can't be used as long as self is dirty.
     unsafe fn write_to_reserved_slot(&self, index: u32, value: T) -> Version {
         let slot = &self.slots[index as usize];
         assert!(slot.is_free());
@@ -171,8 +185,9 @@ impl<T> ConcurrentSlotMap<T> {
 
 // Standard slot map API
 impl<T> ConcurrentSlotMap<T> {
-    /// Create a new map. `concurrent_insert_capacity` and `deferred_remove_capacity` determine how many times
-    /// `concurrent_insert` and `deferred_remove` without returning `OutOfMemory` in between `flush`es.
+    /// Create a new map. `concurrent_insert_capacity` and `deferred_remove_capacity` determine how
+    /// many times `concurrent_insert` and `deferred_remove` without returning `OutOfMemory` in
+    /// between `flush`es.
     pub fn new(concurrent_insert_capacity: usize, deferred_remove_capacity: usize) -> Self {
         Self {
             slots: Default::default(),
@@ -282,7 +297,8 @@ impl SlotHandle {
         SlotHandle { index, version }
     }
 
-    /// Should rarely be used. The handles should be obtained from the slot map when inserting instead.
+    /// Should rarely be used. The handles should be obtained from the slot map when inserting
+    /// instead.
     pub const fn _new(index: u32, version: Version) -> SlotHandle {
         SlotHandle::new(index, version)
     }
@@ -332,14 +348,15 @@ mod slot {
             self.version
         }
 
-        /// SAFETY: self must be free and no further calls to `write` must happen until the slot is `free`d again.
+        /// SAFETY: self must be free and no further calls to `write` must happen until the slot is
+        /// `free`d again.
         pub unsafe fn write(&self, value: T) {
             // Note:
-            // The caller guarantees self is free, so `self.content` is uninit, which means overwritting it below is fine.
-            // SAFETY
-            // Aside from `write`, which the caller guarantees to not call again, there is only two methods that access
-            // access `self.content`: `free` and `get`, which protect against reading uninitialized values via
-            // `self.is_occupied`.
+            // The caller guarantees self is free, so `self.content` is uninit, which means
+            // overwritting it below is fine. SAFETY
+            // Aside from `write`, which the caller guarantees to not call again, there is only two
+            // methods that access access `self.content`: `free` and `get`, which
+            // protect against reading uninitialized values via `self.is_occupied`.
             unsafe { (*self.value.get()).write(value) };
             self.occupied_atomic.store(true, Ordering::Release);
         }
@@ -353,7 +370,8 @@ mod slot {
 
         /// # SAFETY
         /// Must be free.
-        // Although technically not unsafe, this would not drop any overwritten `self.value` which we want to avoid.
+        // Although technically not unsafe, this would not drop any overwritten `self.value` which
+        // we want to avoid.
         pub unsafe fn write_mut(&mut self, value: T) {
             self.value.get_mut().write(value);
             self.occupied = true;
