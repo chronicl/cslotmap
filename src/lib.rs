@@ -38,6 +38,7 @@ type Version = u32;
 /// operations: [`concurrent_insert`](ConcurrentSlotMap::concurrent_insert) and
 /// [`deferred_remove`](ConcurrentSlotMap::deferred_remove).
 ///
+///
 /// Once a concurrent method has been used, the slot map is marked as dirty and other write methods
 /// like [`insert`](ConcurrentSlotMap::insert) and [`remove`](ConcurrentSlotMap::remove) become
 /// unavailable until [`flush`](ConcurrentSlotMap::flush) is called. Read methods like
@@ -60,6 +61,24 @@ type Version = u32;
 ///
 /// These measurements are heavily hardware dependent. Benchmark code can be found in the github
 /// repo.
+///
+/// ### Safety
+///
+/// This is meant as a quick overview of how safety is achieved:
+///
+/// While calling the concurrent operations, non-concurrent **write** methods can't be used, because
+/// the concurrent methods operate on a shared reference (&self) and the non-concurrent write methods
+/// operate on an exclusive reference (&mut self).
+///
+/// While calling the concurrent operations, non-concurrent **read** methods can be used, because
+/// both operate on a shared reference (&self). The methods are safe because
+/// - `deferred_remove`s are stored in a list that the non-concurrent read methods don't access.
+///   The removals are applied on the next `flush(&mut self)` call, at which point they become observable
+///   by the non-concurrent read methods.
+/// - `concurrent_insert` wrties to the same slots the non-concurrent read methods read from.
+///   Each slot is secured by an `AtomicBool`. Non-concurrent read methods on a slot only succeed
+///   if the `AtomicBool` is true, at which point the slot is guaranteed to contain data.
+///   Generation checks happen non-atomically after the atomic occupied check.
 #[derive(Debug)]
 pub struct ConcurrentSlotMap<T> {
     slots: Vec<Slot<T>>,
@@ -76,6 +95,8 @@ pub struct ConcurrentSlotMap<T> {
 impl<T> ConcurrentSlotMap<T> {
     /// Inserts a new item into the map. The item is immediately accessible by all threads.
     pub fn concurrent_insert(&self, value: T) -> Result<SlotHandle, OutOfSpace> {
+        self.dirty.store(true, Ordering::Relaxed);
+
         let (index, version) = if let Some(index) = self.reserve_free_slot() {
             // SAFETY: index was reserved via `reserve_free_slot`. self is marked as dirty in this
             // method.
@@ -89,19 +110,17 @@ impl<T> ConcurrentSlotMap<T> {
             return Err(OutOfSpace);
         };
 
-        self.dirty.store(true, Ordering::Relaxed);
-
         Ok(SlotHandle::new(index, version))
     }
 
     /// Removals are deferred until the next `flush` call.
     /// The removed items can be obtained by calling `flush_with` instead of `flush`.
     pub fn deferred_remove(&self, handle: SlotHandle) -> Result<(), OutOfSpace> {
+        self.dirty.store(true, Ordering::Relaxed);
+
         if self.handle_is_valid(handle) && self.deferred_frees.push(handle.index).is_none() {
             return Err(OutOfSpace);
         }
-
-        self.dirty.store(true, Ordering::Relaxed);
 
         Ok(())
     }
@@ -165,7 +184,7 @@ impl<T> ConcurrentSlotMap<T> {
     }
 
     /// Returns the generation of the slot.
-    /// SAFETY:
+    /// ## SAFETY
     /// index must have previously been reserved via `reserve_free_slot`, so that no other
     /// shared write method can possibly use the same free slot.
     /// self must be marked as dirty, so that no exclusive write method can possibly use the free
