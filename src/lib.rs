@@ -316,8 +316,11 @@ pub struct SlotHandle {
 }
 
 impl SlotHandle {
-    fn index(&self) -> usize {
+    pub fn index(&self) -> usize {
         self.index as usize
+    }
+    pub fn version(&self) -> Version {
+        self.version
     }
 }
 
