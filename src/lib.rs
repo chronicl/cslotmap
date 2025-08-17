@@ -75,7 +75,7 @@ type Version = u32;
 /// - `deferred_remove`s are stored in a list that the non-concurrent read methods don't access.
 ///   The removals are applied on the next `flush(&mut self)` call, at which point they become observable
 ///   by the non-concurrent read methods.
-/// - `concurrent_insert` wrties to the same slots the non-concurrent read methods read from.
+/// - `concurrent_insert` writes to the same slots the non-concurrent read methods read from.
 ///   Each slot is secured by an `AtomicBool`. Non-concurrent read methods on a slot only succeed
 ///   if the `AtomicBool` is true, at which point the slot is guaranteed to contain data.
 ///   Generation checks happen non-atomically after the atomic occupied check.
@@ -126,10 +126,15 @@ impl<T> ConcurrentSlotMap<T> {
     }
 
     pub fn flush(&mut self) {
-        self.flush_with(|_| {})
+        self.flush_with(|_, _| {}, |_, _| {}, |_| {});
     }
 
-    pub fn flush_with<R>(&mut self, free_fn: impl FnOnce(&mut dyn Iterator<Item = T>) -> R) -> R {
+    pub fn flush_with<FR>(
+        &mut self,
+        mut reused_fn: impl FnMut(SlotHandle, &T),
+        mut new_fn: impl FnMut(SlotHandle, &T),
+        free_fn: impl FnOnce(&mut dyn Iterator<Item = (usize, T)>) -> FR,
+    ) -> FR {
         self.dirty.store(false, Ordering::Relaxed);
 
         let Self {
@@ -141,22 +146,29 @@ impl<T> ConcurrentSlotMap<T> {
             ..
         } = self;
 
-        // Move from deferred slots to slots to make space for future shared insertions
-        deferred_slots.clear(|values| {
-            for value in values {
-                slots.push(Slot::new_occupied(value));
-            }
-        });
-
         // Removing reused frees from `free` and updating the non-atomic
         let used = frees_used.load(Ordering::Relaxed);
         frees_used.store(0, Ordering::Relaxed);
         for _ in 0..used.min(free.len()) {
             let index = free.pop().unwrap();
+            let slot = &mut slots[index as usize];
             // SAFETY: We just popped it from `free`, which means it was reused/occupied since last
             // flush.
-            unsafe { slots[index as usize].confirm_write() };
+            unsafe { slot.confirm_write() };
+            let handle = SlotHandle::new(index, slot.version());
+            reused_fn(handle, slot.get_unchecked())
         }
+
+        // Move from deferred slots to slots to make space for future shared insertions
+        deferred_slots.clear(|values| {
+            for value in values {
+                let index = slots.len() as u32;
+                slots.push(Slot::new_occupied(value));
+                let slot = &slots[index as usize];
+                let handle = SlotHandle::new(index, slot.version());
+                new_fn(handle, slot.get_unchecked());
+            }
+        });
 
         // Appying deferred frees
         deferred_frees.clear(|indices| {
@@ -166,7 +178,7 @@ impl<T> ConcurrentSlotMap<T> {
                 if value.is_some() {
                     free.push(index);
                 }
-                value
+                value.map(|v| (index as usize, v))
             });
 
             let r = free_fn(&mut values);
@@ -359,7 +371,7 @@ mod slot {
             (self.version == version && self.is_occupied()).then(|| self.get_unchecked())
         }
 
-        fn get_unchecked(&self) -> &T {
+        pub(crate) fn get_unchecked(&self) -> &T {
             unsafe { (*self.value.get()).assume_init_ref() }
         }
 

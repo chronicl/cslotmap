@@ -77,7 +77,7 @@ impl<T> BumpVec<T> {
             // Sync 1
             self.guards[i].load(Ordering::Acquire);
             let value = std::mem::replace(self.data[i].get_mut(), MaybeUninit::uninit());
-            // I belive this could be Relaxed, because when setting the guard to false,
+            // I believe this could be Relaxed, because when setting the guard to false,
             // no read of the data is performed when the guard is loaded anywhere.
             self.guards[i].store(false, Ordering::Release);
             unsafe { value.assume_init() }
